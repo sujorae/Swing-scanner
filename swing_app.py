@@ -46,6 +46,225 @@ def clean_downloaded_data(df):
 
 
 # ----------------------------------------------------
+# Support, resistance, and watch zone helpers
+# ----------------------------------------------------
+def cluster_price_levels(levels, tolerance_pct=0.006):
+    if not levels:
+        return []
+
+    levels = sorted(float(level) for level in levels if pd.notna(level))
+    clusters = []
+
+    for level in levels:
+        if not clusters:
+            clusters.append([level])
+            continue
+
+        cluster_average = sum(clusters[-1]) / len(clusters[-1])
+
+        if abs(level - cluster_average) / cluster_average <= tolerance_pct:
+            clusters[-1].append(level)
+        else:
+            clusters.append([level])
+
+    clustered_levels = []
+
+    for cluster in clusters:
+        clustered_levels.append({
+            "price": sum(cluster) / len(cluster),
+            "touches": len(cluster)
+        })
+
+    return clustered_levels
+
+
+def find_support_resistance(df, current_price, lookback=150, pivot_window=3, tolerance_pct=0.006):
+    recent = df.tail(lookback).copy()
+
+    if len(recent) < pivot_window * 2 + 1:
+        return [], []
+
+    lows = recent["Low"]
+    highs = recent["High"]
+
+    support_candidates = []
+    resistance_candidates = []
+
+    for i in range(pivot_window, len(recent) - pivot_window):
+        low_window = lows.iloc[i - pivot_window:i + pivot_window + 1]
+        high_window = highs.iloc[i - pivot_window:i + pivot_window + 1]
+
+        current_low = float(lows.iloc[i])
+        current_high = float(highs.iloc[i])
+
+        if current_low <= float(low_window.min()):
+            support_candidates.append(current_low)
+
+        if current_high >= float(high_window.max()):
+            resistance_candidates.append(current_high)
+
+    clustered_supports = cluster_price_levels(support_candidates, tolerance_pct)
+    clustered_resistances = cluster_price_levels(resistance_candidates, tolerance_pct)
+
+    supports = [
+        level for level in clustered_supports
+        if level["price"] < current_price
+    ]
+
+    resistances = [
+        level for level in clustered_resistances
+        if level["price"] > current_price
+    ]
+
+    supports = sorted(
+        supports,
+        key=lambda level: abs(current_price - level["price"])
+    )
+
+    resistances = sorted(
+        resistances,
+        key=lambda level: abs(level["price"] - current_price)
+    )
+
+    return supports[:3], resistances[:3]
+
+
+def format_zone(low_price, high_price):
+    lower = min(low_price, high_price)
+    upper = max(low_price, high_price)
+    return f"{lower:.2f} to {upper:.2f}"
+
+
+def add_percent_distance(level, current_price):
+    if level is None or current_price == 0:
+        return "n/a"
+
+    distance = ((level - current_price) / current_price) * 100
+    return f"{distance:+.2f}%"
+
+
+def build_combined_levels(results, current_price):
+    combined_supports = []
+    combined_resistances = []
+
+    for result in results:
+        if result.get("error"):
+            continue
+
+        levels = result.get("levels", {})
+
+        for support in levels.get("supports", []):
+            combined_supports.append({
+                "price": support["price"],
+                "touches": support["touches"],
+                "timeframe": result["label"]
+            })
+
+        for resistance in levels.get("resistances", []):
+            combined_resistances.append({
+                "price": resistance["price"],
+                "touches": resistance["touches"],
+                "timeframe": result["label"]
+            })
+
+    combined_supports = sorted(
+        combined_supports,
+        key=lambda level: abs(current_price - level["price"])
+    )
+
+    combined_resistances = sorted(
+        combined_resistances,
+        key=lambda level: abs(level["price"] - current_price)
+    )
+
+    return combined_supports, combined_resistances
+
+
+def build_entry_watchlist(valid_results, current_price):
+    combined_supports, combined_resistances = build_combined_levels(valid_results, current_price)
+
+    daily_result = next((r for r in valid_results if r["label"] == "DAILY"), None)
+    four_hour_result = next((r for r in valid_results if r["label"] == "4 HOUR"), None)
+    five_min_result = next((r for r in valid_results if r["label"] == "5 MIN"), None)
+
+    watchlist = []
+
+    closest_support = combined_supports[0] if combined_supports else None
+    closest_resistance = combined_resistances[0] if combined_resistances else None
+
+    if closest_support:
+        support_price = closest_support["price"]
+        zone_low = support_price * 0.995
+        zone_high = support_price * 1.005
+        watchlist.append({
+            "type": "Pullback watch",
+            "price": format_zone(zone_low, zone_high),
+            "note": f"Closest support from {closest_support['timeframe']} chart. This is a possible dip area if price pulls back and holds."
+        })
+
+    if closest_resistance:
+        resistance_price = closest_resistance["price"]
+        breakout_trigger = resistance_price * 1.003
+        watchlist.append({
+            "type": "Breakout watch",
+            "price": f"above {breakout_trigger:.2f}",
+            "note": f"Closest resistance from {closest_resistance['timeframe']} chart. A clean break above this area can show continuation."
+        })
+
+    if four_hour_result:
+        ema9 = four_hour_result["ema9"]
+        ema21 = four_hour_result["ema21"]
+        ema_zone_low = min(ema9, ema21)
+        ema_zone_high = max(ema9, ema21)
+
+        if current_price >= ema_zone_high:
+            watchlist.append({
+                "type": "4 hour EMA retest watch",
+                "price": format_zone(ema_zone_low, ema_zone_high),
+                "note": "Price is above the 4 hour 9 EMA and 21 EMA zone. A controlled retest can be cleaner than chasing."
+            })
+        else:
+            watchlist.append({
+                "type": "4 hour EMA reclaim watch",
+                "price": f"above {ema_zone_high:.2f}",
+                "note": "Price is below the 4 hour EMA zone. Reclaiming this area would improve confirmation."
+            })
+
+    if daily_result:
+        range_low = daily_result.get("range_20_low")
+        range_high = daily_result.get("range_20_high")
+        range_pct = daily_result.get("range_20_pct")
+
+        if range_low and range_high and range_pct is not None and range_pct <= 12:
+            watchlist.append({
+                "type": "Possible accumulation zone",
+                "price": format_zone(range_low, range_high),
+                "note": "Recent daily range is fairly compressed. This can act like a consolidation area, but it still needs confirmation."
+            })
+        elif daily_result["ema50"]:
+            watchlist.append({
+                "type": "Daily trend support watch",
+                "price": f"near {daily_result['ema50']:.2f}",
+                "note": "The daily 50 EMA can act as a larger trend reference if price pulls back toward it."
+            })
+
+    if five_min_result:
+        five_min_supports = five_min_result.get("levels", {}).get("supports", [])
+        five_min_resistances = five_min_result.get("levels", {}).get("resistances", [])
+
+        if five_min_supports and five_min_resistances:
+            intraday_support = five_min_supports[0]["price"]
+            intraday_resistance = five_min_resistances[0]["price"]
+            watchlist.append({
+                "type": "Intraday decision zone",
+                "price": format_zone(intraday_support, intraday_resistance),
+                "note": "Nearest 5 minute support and resistance. This is useful for timing, not for the whole trade thesis."
+            })
+
+    return watchlist, combined_supports, combined_resistances
+
+
+# ----------------------------------------------------
 # Timeframe scanner
 # ----------------------------------------------------
 def analyze_timeframe(ticker, label, period, interval):
@@ -69,7 +288,6 @@ def analyze_timeframe(ticker, label, period, interval):
     high = df["High"]
     low = df["Low"]
     close = df["Close"]
-    volume = df["Volume"]
 
     ema9 = close.ewm(span=9, adjust=False).mean()
     ema21 = close.ewm(span=21, adjust=False).mean()
@@ -88,8 +306,20 @@ def analyze_timeframe(ticker, label, period, interval):
     current_macd_hist = float(macd_hist.iloc[-1]) if pd.notna(macd_hist.iloc[-1]) else None
     previous_macd_hist = float(macd_hist.iloc[-2]) if pd.notna(macd_hist.iloc[-2]) else None
 
+    supports, resistances = find_support_resistance(
+        df=df,
+        current_price=current_price,
+        lookback=150,
+        pivot_window=3,
+        tolerance_pct=0.006
+    )
+
+    range_20_low = float(low.tail(20).min())
+    range_20_high = float(high.tail(20).max())
+    range_20_pct = ((range_20_high - range_20_low) / current_price) * 100 if current_price else None
+
     # RSI logic:
-    # Good long confirmation is RSI above 50 but not extremely overbought.
+    # Good confirmation is RSI above 50 but not extremely overbought.
     # RSI 45 to 50 gets partial credit if it is rising.
     rsi_bullish = current_rsi is not None and 50 <= current_rsi <= 70
     rsi_recovering = (
@@ -116,7 +346,7 @@ def analyze_timeframe(ticker, label, period, interval):
     ema_strong_trend = current_price > current_ema9 and current_ema9 > current_ema21 and current_ema21 > current_ema50
 
     # Candle and structure logic:
-    # These are not bounce rules. They are simple confirmation checks.
+    # These are simple confirmation checks.
     green_candle = current_price > current_open
     higher_low = float(low.iloc[-1]) >= float(low.iloc[-2])
     higher_high = float(high.iloc[-1]) >= float(high.iloc[-2])
@@ -164,6 +394,13 @@ def analyze_timeframe(ticker, label, period, interval):
         "max_score": max_score,
         "rating": rating,
         "checks": checks,
+        "levels": {
+            "supports": supports,
+            "resistances": resistances
+        },
+        "range_20_low": range_20_low,
+        "range_20_high": range_20_high,
+        "range_20_pct": range_20_pct,
         "details": {
             "rsi_bullish": rsi_bullish,
             "rsi_recovering": rsi_recovering,
@@ -259,36 +496,77 @@ def run_scan(ticker):
 
     daily_ok = timeframe_ratings.get("DAILY") in ["YES", "MAYBE"]
     four_hour_ok = timeframe_ratings.get("4 HOUR") in ["YES", "MAYBE"]
-    five_min_ok = timeframe_ratings.get("5 MIN") in ["YES", "MAYBE"]
 
     if final_percent >= 0.72 and daily_ok and four_hour_ok:
-        final_status = "GOOD LONG SETUP"
-        final_notes = "Daily and 4 hour agree enough to support a long bias. The 5 minute can be used for entry timing."
+        final_status = "GOOD ENTRY SETUP"
+        final_notes = "Daily and 4 hour agree enough to support an entry bias. The 5 minute can be used for entry timing."
     elif final_percent >= 0.58 and (daily_ok or four_hour_ok):
         final_status = "WATCHLIST ONLY"
-        final_notes = "Some long signals are there, but confirmation is not strong across enough timeframes yet."
+        final_notes = "Some entry signals are there, but confirmation is not strong across enough timeframes yet."
     else:
-        final_status = "NO LONG SETUP RIGHT NOW"
-        final_notes = "The signals are too mixed or too weak for a clean long entry right now."
+        final_status = "NO ENTRY SETUP RIGHT NOW"
+        final_notes = "The signals are too mixed or too weak for a clean entry right now."
 
     current_price = valid_results[-1]["price"]
+    watchlist, combined_supports, combined_resistances = build_entry_watchlist(valid_results, current_price)
 
     output = []
 
-    output.append("=" * 68)
+    output.append("=" * 72)
     output.append(f"Ticker: {ticker}")
     output.append(f"Scan time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     output.append(f"Current reference price: {current_price:.2f}")
-    output.append("=" * 68)
+    output.append("=" * 72)
     output.append("")
     output.append(f"FINAL STATUS: {final_status}")
     output.append(f"Score: {weighted_score}/{weighted_max} ({final_percent * 100:.1f}%)")
     output.append(final_notes)
     output.append("")
+
+    output.append("KEY PRICE LEVELS")
+    output.append("=" * 72)
+
+    if combined_supports:
+        output.append("Closest support levels below current price:")
+        for level in combined_supports[:3]:
+            output.append(
+                f"  {level['price']:.2f}  "
+                f"({level['timeframe']}, {add_percent_distance(level['price'], current_price)}, "
+                f"{level['touches']} touch{'es' if level['touches'] != 1 else ''})"
+            )
+    else:
+        output.append("Closest support levels below current price: none found")
+
+    output.append("")
+
+    if combined_resistances:
+        output.append("Closest resistance levels above current price:")
+        for level in combined_resistances[:3]:
+            output.append(
+                f"  {level['price']:.2f}  "
+                f"({level['timeframe']}, {add_percent_distance(level['price'], current_price)}, "
+                f"{level['touches']} touch{'es' if level['touches'] != 1 else ''})"
+            )
+    else:
+        output.append("Closest resistance levels above current price: none found")
+
+    output.append("")
+    output.append("ENTRY WATCH AREAS")
+    output.append("=" * 72)
+
+    if watchlist:
+        for item in watchlist:
+            output.append(f"{item['type']}: {item['price']}")
+            output.append(f"  {item['note']}")
+            output.append("")
+    else:
+        output.append("No clean watch areas found from the current data.")
+        output.append("")
+
     output.append("TIMEFRAME CONFIRMATION")
-    output.append("-" * 68)
+    output.append("=" * 72)
     output.append("Timeframe | Rating | RSI | MACD | EMA | Trend | Candle | Structure")
-    output.append("-" * 68)
+    output.append("-" * 72)
 
     for result in results:
         if result.get("error"):
@@ -310,12 +588,12 @@ def run_scan(ticker):
 
     output.append("")
     output.append("DETAILS BY TIMEFRAME")
-    output.append("=" * 68)
+    output.append("=" * 72)
 
     for result in results:
         output.append("")
         output.append(result["label"])
-        output.append("-" * 68)
+        output.append("-" * 72)
 
         if result.get("error"):
             output.append(result["error"])
@@ -329,7 +607,25 @@ def run_scan(ticker):
         output.append(f"21 EMA: {format_float(result['ema21'])}")
         output.append(f"50 EMA: {format_float(result['ema50'])}")
         output.append(f"MACD histogram: {result['macd_hist']:.4f}")
+        output.append(f"20 bar range: {result['range_20_low']:.2f} to {result['range_20_high']:.2f} ({result['range_20_pct']:.2f}%)")
         output.append(f"Score: {result['score']}/{result['max_score']}")
+        output.append("")
+
+        supports = result["levels"]["supports"]
+        resistances = result["levels"]["resistances"]
+
+        if supports:
+            support_text = ", ".join([f"{level['price']:.2f}" for level in supports])
+        else:
+            support_text = "none"
+
+        if resistances:
+            resistance_text = ", ".join([f"{level['price']:.2f}" for level in resistances])
+        else:
+            resistance_text = "none"
+
+        output.append(f"Nearest supports: {support_text}")
+        output.append(f"Nearest resistances: {resistance_text}")
         output.append("")
         output.append(f"RSI bullish or recovering: {yes_no(result['checks']['RSI'])}")
         output.append(f"MACD bullish or improving: {yes_no(result['checks']['MACD'])}")
@@ -349,13 +645,14 @@ def run_scan(ticker):
 
     output.append("")
     output.append("HOW TO READ THIS")
-    output.append("=" * 68)
+    output.append("=" * 72)
     output.append("Daily = larger trend direction.")
     output.append("4 hour = main swing setup confirmation.")
     output.append("5 minute = entry timing, not the main reason to take the trade.")
     output.append("")
-    output.append("A cleaner long entry usually has DAILY and 4 HOUR showing YES or MAYBE.")
-    output.append("The 5 minute helps avoid entering while the short term chart is still weak.")
+    output.append("A cleaner entry usually has DAILY and 4 HOUR showing YES or MAYBE.")
+    output.append("Support and resistance are estimated from recent pivot highs and pivot lows.")
+    output.append("Watch areas are zones to monitor, not automatic buy signals.")
     output.append("")
     output.append("This scanner does not guarantee a winning trade. It only checks whether the setup is technically aligned.")
 
@@ -436,7 +733,7 @@ title_label.pack(anchor="w")
 
 subtitle_label = ttk.Label(
     main_frame,
-    text="Checks long entry confirmation across 5 minute, 4 hour, and daily trend conditions."
+    text="Checks entry confirmation, price levels, and watch zones across multiple timeframes."
 )
 subtitle_label.pack(anchor="w", pady=(4, 20))
 
