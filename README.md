@@ -1,6 +1,6 @@
 # Swing Scanner
 
-Swing Scanner is a Python desktop app that checks whether a stock has a clean long setup across multiple timeframes. It looks at the 5 minute, 4 hour, and daily charts to compare short term entry timing with the larger trend.
+Swing Scanner is a Python desktop app that checks whether a stock has a clean setup across multiple timeframes. It looks at the 5 minute, 4 hour, and daily charts to compare short term entry timing with the larger trend.
 
 The app uses RSI, MACD, EMA trend structure, candle direction, and basic price structure to give each timeframe a rating of YES, MAYBE, or NO. It then gives a final status for whether the ticker looks like a good long setup, a watchlist setup, or no setup right now.
 
